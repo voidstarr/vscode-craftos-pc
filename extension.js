@@ -8,15 +8,23 @@ const process = require('process');
 const semver = require('semver');
 const URL = require('url').URL;
 const vscode = require('vscode');
-// const vsls = require('vsls');
+const vsls = require('vsls');
 const WebSocket = require('ws');
 
 var connections = {}; // Map of connection ID to connection objects
 var windows = {}; // Map of "connectionId:windowId" to window objects
 var crcTable = null;
 var extcontext = null;
-/** @type vscode.OutputChannel */
-var log = { appendLine: () => { } };
+var log = {
+    name: "CraftOS-PC",
+    append: function (value) { void value; },
+    appendLine: function (value) { void value; },
+    replace: function (value) { void value; },
+    clear: () => { },
+    show: () => { },
+    hide: () => { },
+    dispose: () => { }
+};
 
 function makeCRCTable() {
     let c;
@@ -75,12 +83,12 @@ const computer_provider = {
     getChildren: element => {
         if (element === undefined || element === null) {
             let arr = [];
-            for (let connectionId in connections) {
-                for (let w in windows) {
-                    if (w.startsWith(connectionId + ":") && !windows[w].isMonitor) {
-                        const title = windows[w].term && windows[w].term.title ? windows[w].term.title : `Computer ${connectionId}`;
-                        arr.push({ title: `[${connectionId}] ${title}`, id: w, connectionId: connectionId });
-                    }
+            // Build list directly from window map so guests see host windows too
+            for (let w in windows) {
+                if (!windows[w].isMonitor) {
+                    const connectionId = w.split(":")[0];
+                    const title = windows[w].term && windows[w].term.title ? windows[w].term.title : `Computer ${connectionId}`;
+                    arr.push({ title: `[${connectionId}] ${title}`, id: w, connectionId: connectionId });
                 }
             }
             return arr;
@@ -90,7 +98,9 @@ const computer_provider = {
         let r = new vscode.TreeItem(element.title);
         r.iconPath = vscode.Uri.file(path.join(extcontext.extensionPath, 'media/computer.svg'));
         r.command = { command: "craftos-pc.open-window", title: "CraftOS-PC: Open Window", arguments: [element] };
-        if (connections[element.connectionId] && connections[element.connectionId].supportsFilesystem) r.contextValue = "data-available";
+        const supportsFS = (connections[element.connectionId] && connections[element.connectionId].supportsFilesystem) ||
+            (isLiveShareGuest && remoteFlags[element.connectionId] && remoteFlags[element.connectionId].supportsFilesystem);
+        if (supportsFS) r.contextValue = "data-available";
         return r;
     },
     _onDidChangeTreeData: new vscode.EventEmitter(),
@@ -101,12 +111,12 @@ const monitor_provider = {
     getChildren: element => {
         if (element === undefined || element === null) {
             let arr = [];
-            for (let connectionId in connections) {
-                for (let w in windows) {
-                    if (w.startsWith(connectionId + ":") && windows[w].isMonitor) {
-                        const title = windows[w].term && windows[w].term.title ? windows[w].term.title : `Monitor ${connectionId}`;
-                        arr.push({ title: `[${connectionId}] ${title}`, id: w, connectionId: connectionId });
-                    }
+            // Build list directly from window map so guests see host windows too
+            for (let w in windows) {
+                if (windows[w].isMonitor) {
+                    const connectionId = w.split(":")[0];
+                    const title = windows[w].term && windows[w].term.title ? windows[w].term.title : `Monitor ${connectionId}`;
+                    arr.push({ title: `[${connectionId}] ${title}`, id: w, connectionId: connectionId });
                 }
             }
             return arr;
@@ -127,12 +137,68 @@ var connections = {}; // Map of connection ID to connection objects
 var nextConnectionId = 1;
 var didShowBetaMessage = false;
 var processFeatures = {};
-// /** @type vsls.LiveShare|null */
+/** @type vsls.LiveShare|null */
 var liveshare = null;
-// /** @type vsls.SharedServiceProxy|null */
+/** @type vsls.SharedServiceProxy|null */
 var vslsClient = null;
-// /** @type vsls.SharedService|null */
+/** @type vsls.SharedService|null */
 var vslsServer = null;
+// Live Share guest-only flags per connection (received from host)
+var remoteFlags = {}; // { [connectionId: string]: { isVersion11: boolean, useBinaryChecksum: boolean, supportsFilesystem: boolean } }
+var isLiveShareGuest = false;
+// Live Share guest-only connections summary (received from host)
+var remoteConnections = {}; // { [connectionId: string]: { type: string, connected: boolean, supportsFilesystem: boolean, isVersion11: boolean, useBinaryChecksum: boolean } }
+
+// Notify Live Share guests about state changes. If full is true, send the
+// entire windows map. Otherwise, send a compact update for a single window.
+function notifyLiveShareState(full = false, updatedWindowKey = null) {
+    if (vslsServer === null) return;
+    const payload = { flags: buildLiveShareFlags(), connections: buildLiveShareConnections() };
+    if (full || !updatedWindowKey || !windows[updatedWindowKey]) {
+        // Full state (may be large): windows + flags + connections
+        payload.windows = windows;
+    } else {
+        // Compact update: just the latest term for the updated window
+        payload.update = { id: updatedWindowKey, term: windows[updatedWindowKey].term };
+    }
+    vslsServer.notify("state", payload);
+}
+
+// Build per-connection feature flags for Live Share guests
+function buildLiveShareFlags() {
+    /** @type {Record<string, {isVersion11: boolean, useBinaryChecksum: boolean, supportsFilesystem: boolean}>} */
+    const flags = {};
+    for (let id in connections) {
+        const conn = connections[id];
+        if (!conn) continue;
+        flags[id] = {
+            isVersion11: !!conn.isVersion11,
+            useBinaryChecksum: !!conn.useBinaryChecksum,
+            supportsFilesystem: !!conn.supportsFilesystem,
+        };
+    }
+    return flags;
+}
+
+// Build a simple connections summary for Live Share guests
+function buildLiveShareConnections() {
+    /** @type {Record<string, {type: string, connected: boolean, supportsFilesystem: boolean, isVersion11: boolean, useBinaryChecksum: boolean}>} */
+    const summary = {};
+    for (let id in connections) {
+        const conn = connections[id];
+        if (!conn) continue;
+        const isWebSocket = conn.connection && conn.connection.connected !== undefined;
+        const connected = isWebSocket ? !!conn.connection.connected : true;
+        summary[id] = {
+            type: isWebSocket ? 'WebSocket' : 'Process',
+            connected,
+            supportsFilesystem: !!conn.supportsFilesystem,
+            isVersion11: !!conn.isVersion11,
+            useBinaryChecksum: !!conn.useBinaryChecksum,
+        };
+    }
+    return summary;
+}
 
 function getSetting(name) {
     const config = vscode.workspace.getConfiguration(name);
@@ -172,7 +238,7 @@ function closeAllWindows() {
     windows = {};
     computer_provider._onDidChangeTreeData.fire(null);
     monitor_provider._onDidChangeTreeData.fire(null);
-    if (vslsServer !== null) vslsServer.notify("windows", {});
+    notifyLiveShareState(true);
 }
 
 function closeConnection(connectionId) {
@@ -198,7 +264,7 @@ function closeConnection(connectionId) {
     delete connections[connectionId];
     computer_provider._onDidChangeTreeData.fire(null);
     monitor_provider._onDidChangeTreeData.fire(null);
-    if (vslsServer !== null) vslsServer.notify("windows", windows);
+    notifyLiveShareState(true);
 }
 
 function queueDataRequest(connectionId, id, type, path, path2) {
@@ -217,8 +283,8 @@ function queueDataRequest(connectionId, id, type, path, path2) {
     data[2] = type;
     data[3] = conn.nextDataRequestID;
     conn.nextDataRequestID = (conn.nextDataRequestID + 1) & 0xFF;
-    pathbuf.copy(data, 4);
-    if (typeof path2 === "string") path2buf.copy(data, 5 + pathbuf.length);
+    data.set(pathbuf, 4);
+    if (typeof path2 === "string") data.set(path2buf, 5 + pathbuf.length);
     const b64 = data.toString('base64');
     const packet = "!CPC" + ("000" + b64.length.toString(16)).slice(-4) + b64 + ("0000000" + crc32(conn.useBinaryChecksum ? data.toString("binary") : b64).toString(16)).slice(-8) + "\n";
     conn.connection.stdin.write(packet, 'utf8');
@@ -229,7 +295,7 @@ function queueDataRequest(connectionId, id, type, path, path2) {
         data2[2] = 0;
         data2[3] = data[3];
         data2.writeInt32LE(filedata.length, 4);
-        filedata.copy(data2, 8);
+        data2.set(filedata, 8);
         const b642 = data2.toString('base64');
         const packet2 = (b642.length > 65535 ? "!CPD" + ("00000000000" + b642.length.toString(16)).slice(-12) : "!CPC" + ("000" + b642.length.toString(16)).slice(-4)) + b642 + ("0000000" + crc32(conn.useBinaryChecksum ? data2.toString("binary") : b642).toString(16)).slice(-8) + "\n";
         conn.connection.stdin.write(packet2, 'utf8');
@@ -251,7 +317,7 @@ function queueDataRequest(connectionId, id, type, path, path2) {
 function checkVersion(silent) {
     const exe_path = getSetting("craftos-pc.executablePath");
     if (exe_path === null) return;
-    child_process.execFile(exe_path, ["--version"], { windowsHide: true }, (err, stdout, stderr) => {
+    child_process.execFile(exe_path, ["--version"], { windowsHide: true }, (err, stdout) => {
         if (err) {
             if (!silent) vscode.window.showErrorMessage("Failed to detect CraftOS-PC version (error: " + err.message + "). Please check that the path is correct and working properly.");
             return;
@@ -278,15 +344,15 @@ function checkVersion(silent) {
  */
 class RawFileSystemProvider {
     constructor() {
-        this._onDidChangeFile = new vscode.EventEmitter()
-        this.onDidChangeFile = this._onDidChangeFile.event
+        this._onDidChangeFile = new vscode.EventEmitter();
+        this.onDidChangeFile = this._onDidChangeFile.event;
     }
 
     _getConnectionFromUri(uri) {
         // Extract connection ID from authority (e.g., "conn1-windowId" or just "windowId")
         const parts = uri.authority.split('-');
-        let connectionId = parts.length > 1 ? parts[0] : '1'; // Default to connection 1 if not specified
-        let windowId = parts.length > 1 ? parseInt(parts[1]) : parseInt(uri.authority);
+        const connectionId = parts.length > 1 ? parts[0] : '1'; // Default to connection 1 if not specified
+        const windowId = parts.length > 1 ? parseInt(parts[1]) : parseInt(uri.authority);
 
         const conn = connections[connectionId];
         if (!conn || !conn.connection) throw vscode.FileSystemError.Unavailable("Connection not open");
@@ -301,9 +367,8 @@ class RawFileSystemProvider {
      * @param {{overwrite: boolean}} options
      */
     copy(source, destination, options) {
-        if (source.authority !== destination.authority) throw vscode.FileSystemError.Unavailable("Cannot move across computers");
-        const { connectionId, windowId } = this._getConnectionFromUri(source);
-        return queueDataRequest(connectionId, windowId, 12, source.path, destination.path);
+        void source; void destination; void options;
+        throw vscode.FileSystemError.Unavailable("Copy is not supported by CraftOS-PC filesystem");
     }
     /**
      * @param {vscode.Uri} uri 
@@ -317,7 +382,7 @@ class RawFileSystemProvider {
      * @param {{recursive: boolean}} options
      */
     delete(uri, options) {
-        // Warning: ignores options.recursive (always true)
+        void options;
         const { connectionId, windowId } = this._getConnectionFromUri(uri);
         return queueDataRequest(connectionId, windowId, 11, uri.path);
     }
@@ -363,8 +428,8 @@ class RawFileSystemProvider {
      * @param {{overwrite: boolean}} options 
      */
     rename(oldUri, newUri, options) {
-        // Warning: ignores overwrite (always false)
-        if (oldUri.authority !== newUri.authority) throw vscode.FileSystemError.Unavailable("Cannot move across computers");
+        void options; // overwrite ignored
+        if (oldUri.authority !== newUri.authority) throw vscode.FileSystemError.Unavailable("Cannot move files between connections");
         const { connectionId, windowId } = this._getConnectionFromUri(oldUri);
         return queueDataRequest(connectionId, windowId, 13, oldUri.path, newUri.path);
     }
@@ -388,8 +453,7 @@ class RawFileSystemProvider {
      * @param {{excludes: string[], recursive: boolean}} options
      */
     watch(uri, options) {
-        // unimplemented
-        const { connectionId, windowId } = this._getConnectionFromUri(uri);
+        void uri; void options; // unimplemented
         return null;
     }
     /**
@@ -398,6 +462,7 @@ class RawFileSystemProvider {
      * @param {{create: boolean, overwrite: boolean}} options
      */
     writeFile(uri, content, options) {
+        void options;
         const { connectionId, windowId } = this._getConnectionFromUri(uri);
         return queueDataRequest(connectionId, windowId, 21, uri.path, content);
     }
@@ -407,7 +472,7 @@ const debugAdapterFactory = {
     /**
      * @param {vscode.DebugSession} session
      */
-    createDebugAdapterDescriptor: (session, executable) => {
+    createDebugAdapterDescriptor: (session) => {
         if (session.configuration.request === "launch") {
             if (!processFeatures.debugger) {
                 vscode.window.showErrorMessage("This version of CraftOS-PC does not support debugging. Please update to the latest version.");
@@ -565,7 +630,7 @@ function processDataChunk(connectionId, chunk) {
                 delete windows[windowKey];
                 computer_provider._onDidChangeTreeData.fire(null);
                 monitor_provider._onDidChangeTreeData.fire(null);
-                if (vslsServer !== null) vslsServer.notify("windows", windows);
+                notifyLiveShareState(true);
                 chunk = chunk.subarray(size + 16);
                 while (String.fromCharCode(chunk[0]).match(/\s/)) chunk = chunk.subarray(1);
                 continue;
@@ -603,7 +668,7 @@ function processDataChunk(connectionId, chunk) {
             const previousFilesystemSupport = conn.supportsFilesystem;
             conn.supportsFilesystem = (flags & 2) === 2;
             computer_provider._onDidChangeTreeData.fire(null);
-            if (vslsServer !== null) vslsServer.notify("flags", { isVersion11: conn.isVersion11, useBinaryChecksum: conn.useBinaryChecksum, supportsFilesystem: false });
+            notifyLiveShareState(true);
 
             // Auto-connect filesystem if it's newly supported
             if (conn.supportsFilesystem && !previousFilesystemSupport) {
@@ -684,13 +749,13 @@ function processDataChunk(connectionId, chunk) {
             }
             const size = stream.readUInt32();
             const data = Buffer.alloc(size);
-            stream.str.copy(data, 0, stream.pos);
+            // Use set instead of copy to satisfy type constraints
+            data.set(stream.str.subarray(stream.pos, stream.pos + size), 0);
             if (fail) conn.dataRequestCallbacks[reqid](null, new Error(data.toString()));
             else conn.dataRequestCallbacks[reqid](data);
             delete conn.dataRequestCallbacks[reqid];
         }
-        let newWindow = false;
-        if (windows[windowKey] === undefined) { windows[windowKey] = {}; newWindow = true; }
+        if (windows[windowKey] === undefined) { windows[windowKey] = {}; }
         if (windows[windowKey].term === undefined) windows[windowKey].term = {};
         for (let k in term) windows[windowKey].term[k] = term[k];
         if (windows[windowKey].isMonitor === undefined) {
@@ -707,8 +772,8 @@ function processDataChunk(connectionId, chunk) {
             windows[windowKey].panel.title = windows[windowKey].term.title || "CraftOS-PC Terminal";
         }
         if (vslsServer !== null) {
-            if (newWindow) vslsServer.notify("windows", windows);
-            else vslsServer.notify("term", { id: windowKey, term: windows[windowKey].term, refresh: type === 4 });
+            // Notify Live Share guests with a compact update
+            notifyLiveShareState(true);
         }
         if (type === 4) {
             computer_provider._onDidChangeTreeData.fire(null);
@@ -886,7 +951,6 @@ function openPanel(connectionId, windowId, force) {
     }
 
     const conn = connections[connectionId];
-    if (!conn) return;
 
     const customFont = vscode.workspace.getConfiguration("craftos-pc.customFont");
     let fontPath = customFont.get("path");
@@ -917,18 +981,33 @@ function openPanel(connectionId, windowId, force) {
     panel.iconPath = windows[windowKey] && windows[windowKey].isMonitor ? vscode.Uri.file(path.join(extcontext.extensionPath, 'media/monitor.svg')) : vscode.Uri.file(path.join(extcontext.extensionPath, 'media/computer.svg'));
     panel.webview.html = fs.readFileSync(onDiskPath.fsPath, 'utf8');
     panel.webview.onDidReceiveMessage(message => {
-        if (typeof message !== "object" || !conn.connection) return;
+        if (typeof message !== "object") return;
+        // Handle font path request
         if (message.getFontPath === true) {
             if (fontPath !== null && fontPath !== "") panel.webview.postMessage({ fontPath: panel.webview.asWebviewUri(vscode.Uri.file(fontPath)).toString() });
             return;
         }
+        // Build packet from webview message
         const data = Buffer.alloc(message.data.length / 2 + 2);
         data[0] = message.type;
         data[1] = windowId;
-        Buffer.from(message.data, 'hex').copy(data, 2)
+        // Use set() to avoid TS lib typing issues with Buffer#copy
+        data.set(Buffer.from(message.data, 'hex'), 2);
         const b64 = data.toString('base64');
-        const packet = "!CPC" + ("000" + b64.length.toString(16)).slice(-4) + b64 + ("0000000" + crc32(conn.useBinaryChecksum ? data.toString("binary") : b64).toString(16)).slice(-8) + "\n";
-        conn.connection.stdin.write(packet, 'utf8');
+
+        // Prefer local connection if available
+        if (conn && conn.connection && conn.connection.stdin) {
+            const packet = "!CPC" + ("000" + b64.length.toString(16)).slice(-4) + b64 + ("0000000" + crc32(conn.useBinaryChecksum ? data.toString("binary") : b64).toString(16)).slice(-8) + "\n";
+            conn.connection.stdin.write(packet, 'utf8');
+            return;
+        }
+
+        // Fallback to Live Share guest path (route to host)
+        if (liveshare && vslsClient && liveshare.session && liveshare.session.role === vsls.Role.Guest) {
+            const flags = remoteFlags[connectionId] || { useBinaryChecksum: false };
+            const packet = "!CPC" + ("000" + b64.length.toString(16)).slice(-4) + b64 + ("0000000" + crc32(flags.useBinaryChecksum ? data.toString("binary") : b64).toString(16)).slice(-8) + "\n";
+            vslsClient.notify("packet", { connectionId: connectionId, data: packet, peer: liveshare.session.peerNumber });
+        }
     });
     panel.onDidChangeViewState(e => {
         if (e.webviewPanel.active && windows[windowKey].term !== undefined) {
@@ -944,7 +1023,10 @@ function openPanel(connectionId, windowId, force) {
         windows[windowKey].panel.webview.postMessage(windows[windowKey].term);
         windows[windowKey].panel.title = windows[windowKey].term.title || "CraftOS-PC Terminal";
     }
-    if (newWindow && vslsServer !== null) vslsServer.notify("windows", windows);
+    if (newWindow && vslsServer !== null) {
+        // Send consolidated state including flags for all connections
+        notifyLiveShareState(true);
+    }
 }
 
 // Helper function to get available connections for user selection
@@ -1032,9 +1114,22 @@ function activate(context) {
         debugInfo.push(`Total windows: ${Object.keys(windows).length}`);
         debugInfo.push("");
 
-        if (Object.keys(connections).length === 0) {
+        if (Object.keys(connections).length === 0 && !isLiveShareGuest) {
             debugInfo.push("No active connections.");
         } else {
+            if (isLiveShareGuest && Object.keys(connections).length === 0) {
+                debugInfo.push("Guest mode: showing remote connection summaries");
+                for (let connectionId in remoteConnections) {
+                    const rc = remoteConnections[connectionId];
+                    debugInfo.push(`Remote Connection ${connectionId}:`);
+                    debugInfo.push(`  Type: ${rc.type}`);
+                    debugInfo.push(`  Connected: ${rc.connected}`);
+                    debugInfo.push(`  Version 1.1: ${rc.isVersion11}`);
+                    debugInfo.push(`  Binary Checksum: ${rc.useBinaryChecksum}`);
+                    debugInfo.push(`  Filesystem Support: ${rc.supportsFilesystem}`);
+                }
+                debugInfo.push("");
+            }
             for (let connectionId in connections) {
                 const conn = connections[connectionId];
                 debugInfo.push(`Connection ${connectionId}:`);
@@ -1166,7 +1261,8 @@ function activate(context) {
     }));
 
     context.subscriptions.push(vscode.commands.registerCommand('craftos-pc.open-window', async obj => {
-        if (Object.keys(connections).length === 0) {
+        // Allow guests to open host windows even without local connections
+        if (Object.keys(connections).length === 0 && !isLiveShareGuest) {
             vscode.window.showErrorMessage("Please open CraftOS-PC before using this command.");
             return;
         }
@@ -1176,8 +1272,22 @@ function activate(context) {
             const windowId = parseInt(parts[1]);
             openPanel(connectionId, windowId);
         } else {
-            const connectionId = await pickConnection("Select connection to open window:");
-            if (!connectionId) return;
+            let connectionId;
+            if (isLiveShareGuest && Object.keys(connections).length === 0) {
+                // Build choices from windows map for guests
+                const ids = Array.from(new Set(Object.keys(windows).map(k => k.split(':')[0])));
+                if (ids.length === 0) {
+                    vscode.window.showErrorMessage("No host windows available to open.");
+                    return;
+                }
+                const choices = ids.map(id => ({ label: `Connection ${id}`, description: `${Object.keys(windows).filter(k => k.startsWith(id + ':')).length} windows`, connectionId: id }));
+                const selected = await vscode.window.showQuickPick(choices, { placeHolder: "Select connection to open window:" });
+                if (!selected) return;
+                connectionId = selected.connectionId;
+            } else {
+                connectionId = await pickConnection("Select connection to open window:");
+                if (!connectionId) return;
+            }
 
             vscode.window.showInputBox({ prompt: "Enter the window ID:", validateInput: str => isNaN(parseInt(str)) ? "Invalid number" : null }).then(windowId => {
                 if (windowId) openPanel(connectionId, parseInt(windowId));
@@ -1445,87 +1555,103 @@ function activate(context) {
     vscode.window.createTreeView("craftos-computers", { "treeDataProvider": computer_provider });
     vscode.window.createTreeView("craftos-monitors", { "treeDataProvider": monitor_provider });
 
-    // TODO: multi-connection live share
-    /*
-     vsls.getApi(context.extension.id).then(api => {
+    // multi-connection live share
+    vsls.getApi(context.extension.id).then(api => {
         if (api === null) return;
         liveshare = api;
+
         const updateSession = () => {
-            if (liveshare.session.role === vsls.Role.Host && vslsServer === null) {
-                if (vslsClient !== null && process_connection === null) {
-                    windows = {};
-                    computer_provider._onDidChangeTreeData.fire(null);
-                    monitor_provider._onDidChangeTreeData.fire(null);
-                    vslsClient = null;
+            if (liveshare.session.role === vsls.Role.Host) {
+                isLiveShareGuest = false;
+                if (vslsServer === null) {
+                    liveshare.shareService("terminal").then(svc => {
+                        vslsServer = svc;
+
+                        // Route guest keystroke packets to the correct local connection
+                        vslsServer.onNotify("packet", data => {
+                            const d = /** @type {any} */ (data);
+                            // TODO: Add actual access control (MicrosoftDocs/live-share#1716)
+                            const peer = liveshare.peers.find(a => a.peerNumber == d.peer);
+                            if (!peer || (peer.access !== vsls.Access.ReadWrite && peer.access !== vsls.Access.Owner)) return;
+                            const targetId = d.connectionId;
+                            const conn = connections[targetId];
+                            if (conn && conn.connection && conn.connection.stdin) conn.connection.stdin.write(d.data, "utf8");
+                        });
+
+                        // Provide consolidated state on request
+                        const sendState = () => notifyLiveShareState(true);
+                        vslsServer.onNotify("get-state", sendState);
+                    }).catch(err => vscode.window.showErrorMessage("Could not create Live Share service: " + err));
                 }
-                liveshare.shareService("terminal").then(svc => {
-                    vslsServer = svc;
-                    vslsServer.onNotify("packet", data => {
-                        // TODO: Add actual access control (MicrosoftDocs/live-share#1716)
-                        const peer = liveshare.peers.find(a => a.peerNumber == data.peer);
-                        if (process_connection !== null && (peer.access === vsls.Access.ReadWrite || peer.access === vsls.Access.Owner)) process_connection.stdin.write(data.data, "utf8");
-                    });
-                    vslsServer.onNotify("get-windows", () => {
-                        vslsServer.notify("windows", windows);
-                        vslsServer.notify("flags", {isVersion11: isVersion11, useBinaryChecksum: useBinaryChecksum, supportsFilesystem: false});
-                    });
-                }).catch(err => vscode.window.showErrorMessage("Could not create Live Share service: " + err));
-            } else if (liveshare.session.role === vsls.Role.Guest && vslsClient === null) {
+            } else if (liveshare.session.role === vsls.Role.Guest) {
                 vslsServer = null;
-                liveshare.getSharedService("terminal").then(svc => {
-                    vslsClient = svc;
-                    vslsClient.onNotify("windows", param => {
-                        let newwindows = {};
-                        for (let id in param) newwindows[id] = {term: param[id].term, isMonitor: param[id].isMonitor, panel: windows[id] ? windows[id].panel : undefined};
-                        for (let id in windows) if (!newwindows[id] && windows[id].panel) windows[id].panel.dispose();
-                        windows = newwindows;
-                        computer_provider._onDidChangeTreeData.fire(null);
-                        monitor_provider._onDidChangeTreeData.fire(null);
-                    });
-                    vslsClient.onNotify("term", param => {
-                        windows[param.id].term = param.term
-                        if (windows[param.id].panel) {
-                            windows[param.id].panel.webview.postMessage(param.term);
-                            windows[param.id].panel.title = param.term.title || "CraftOS-PC Terminal";
-                        }
-                        if (param.refresh) {
+                if (vslsClient === null) {
+                    liveshare.getSharedService("terminal").then(svc => {
+                        vslsClient = svc;
+                        isLiveShareGuest = true;
+                        remoteFlags = {};
+                        remoteConnections = {};
+
+                        const rebuildWindows = (param) => {
+                            let newwindows = {};
+                            for (let id in param) newwindows[id] = { term: param[id].term, isMonitor: param[id].isMonitor, panel: windows[id] ? windows[id].panel : undefined };
+                            // Dispose panels for windows that no longer exist
+                            for (let id in windows) if (!newwindows[id] && windows[id].panel) windows[id].panel.dispose();
+                            windows = newwindows;
+                            // Refresh any open panels with the latest terminal state from host
+                            for (let id in windows) {
+                                if (windows[id].panel && windows[id].term) {
+                                    windows[id].panel.webview.postMessage(windows[id].term);
+                                    windows[id].panel.title = windows[id].term.title || "CraftOS-PC Terminal";
+                                }
+                            }
                             computer_provider._onDidChangeTreeData.fire(null);
                             monitor_provider._onDidChangeTreeData.fire(null);
-                        }
-                    });
-                    vslsClient.onNotify("flags", param => {
-                        isVersion11 = param.isVersion11;
-                        useBinaryChecksum = param.useBinaryChecksum;
-                        supportsFilesystem = param.supportsFilesystem;
-                    });
-                    process_connection = {
-                        connected: true,
-                        disconnect: () => {},
-                        kill: () => {},
-                        stdin: {write: data => {
-                            if (liveshare.session.access === vsls.Access.ReadWrite || liveshare.session.access === vsls.Access.Owner) vslsClient.notify("packet", {data: data, peer: liveshare.session.peerNumber});
-                        }}
-                    };
-                    vslsClient.notify("get-windows", {});
-                }).catch(err => vscode.window.showErrorMessage("Could not connect to Live Share service: " + err));
+                        };
+
+                        // Consolidated state message; supports full windows or compact per-window updates
+                        vslsClient.onNotify("state", payload => {
+                            const p = /** @type {any} */ (payload);
+                            if (!p) return;
+                            if (p.windows) rebuildWindows(p.windows);
+                            else if (p.update && p.update.id && windows[p.update.id]) {
+                                // Apply compact term update to existing window
+                                windows[p.update.id].term = p.update.term;
+                                if (windows[p.update.id].panel && windows[p.update.id].term) {
+                                    windows[p.update.id].panel.webview.postMessage(windows[p.update.id].term);
+                                    windows[p.update.id].panel.title = windows[p.update.id].term.title || "CraftOS-PC Terminal";
+                                }
+                            }
+                            if (p.flags) remoteFlags = p.flags;
+                            if (p.connections) remoteConnections = p.connections;
+                        });
+
+                        // Request initial state
+                        vslsClient.notify("get-state", {});
+                    }).catch(err => vscode.window.showErrorMessage("Could not connect to Live Share service: " + err));
+                }
             } else if (liveshare.session.role === vsls.Role.None) {
-                if (vslsClient !== null && process_connection !== null && process_connection.isLiveShare) {
-                    windows = {};
-                    computer_provider._onDidChangeTreeData.fire(null);
-                    monitor_provider._onDidChangeTreeData.fire(null);
+                // Tear down guest state if we were a guest
+                if (vslsClient !== null) {
+                    if (isLiveShareGuest) {
+                        for (let id in windows) if (windows[id].panel) windows[id].panel.dispose();
+                        windows = {};
+                        computer_provider._onDidChangeTreeData.fire(null);
+                        monitor_provider._onDidChangeTreeData.fire(null);
+                        isLiveShareGuest = false;
+                        remoteFlags = {};
+                        remoteConnections = {};
+                    }
                     vslsClient = null;
-                    process_connection = null;
                 }
                 vslsServer = null;
             }
         };
+
         liveshare.onDidChangeSession(updateSession);
-        liveshare.onDidChangePeers(() => {
-            if (vslsServer !== null) vslsServer.notify("windows", windows);
-        });
+        liveshare.onDidChangePeers(() => { notifyLiveShareState(true); });
         if (liveshare.session.role !== vsls.Role.None) updateSession();
     });
-    */
 
     checkVersion(true);
 }
